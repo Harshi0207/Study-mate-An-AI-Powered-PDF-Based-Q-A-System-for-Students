@@ -1,3 +1,9 @@
+# StudyMate - Comprehensive Academic Assistant
+# Single-cell Google Colab implementation
+
+# Install required packages
+!pip install -q transformers accelerate torch gradio pypdf2 python-docx fpdf sentencepiece
+
 import gradio as gr
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -18,7 +24,7 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
 # ==================== MODEL INITIALIZATION ====================
-print("🚀 Loading IBM Granite 3.0 2B model...")
+print("🚀 Loading IBM Granite 3.3 2B model...")
 
 try:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -38,8 +44,6 @@ class PDFManager:
     def __init__(self):
         self.pdfs = {}  # {filename: {"text": str, "chunks": list, "metadata": dict}}
         self.chat_history = []
-        self.current_quiz = None
-        self.quiz_score = 0
         
     def add_pdf(self, file_path: str, file_name: str) -> str:
         try:
@@ -77,8 +81,6 @@ class PDFManager:
     def clear(self):
         self.pdfs = {}
         self.chat_history = []
-        self.current_quiz = None
-        self.quiz_score = 0
 
 pdf_manager = PDFManager()
 
@@ -201,148 +203,17 @@ def generate_questions() -> str:
     
     return "\n".join(all_questions)
 
-# ==================== QUIZ FUNCTIONS ====================
-def generate_quiz(num_questions: int = 5) -> str:
-    """Generate a quiz from PDF content."""
+def doubt_assistant(doubt: str) -> str:
+    """Assist with academic doubts and explanations."""
     if not pdf_manager.pdfs:
-        return "⚠️ Please upload at least one PDF first."
-    
-    context = pdf_manager.get_all_text()[:3000]
-    
-    prompt = f"""Based on the following content, generate exactly {num_questions} multiple-choice questions with 4 options each.
-Format each question EXACTLY as follows:
-
-Q1: [Question text]
-A) [Option A]
-B) [Option B]
-C) [Option C]
-D) [Option D]
-Correct Answer: [A/B/C/D]
-
-Content:
-{context}
-
-Generate the quiz:"""
-    
-    quiz_text = generate_response(prompt, max_length=800)
-    
-    # Parse and store quiz
-    pdf_manager.current_quiz = parse_quiz(quiz_text)
-    pdf_manager.quiz_score = 0
-    
-    # Format quiz for display (without correct answers)
-    display_quiz = format_quiz_for_display(quiz_text)
-    
-    return display_quiz
-
-def parse_quiz(quiz_text: str) -> Dict:
-    """Parse quiz text into structured format."""
-    quiz_data = {}
-    
-    # Split by question numbers
-    questions = re.split(r'Q\d+:', quiz_text)
-    questions = [q.strip() for q in questions if q.strip()]
-    
-    for i, question_block in enumerate(questions, 1):
-        lines = question_block.split('\n')
-        question_text = lines[0].strip() if lines else ""
-        
-        # Extract options
-        options = {}
-        correct_answer = ""
-        
-        for line in lines[1:]:
-            line = line.strip()
-            if line.startswith(('A)', 'B)', 'C)', 'D)')):
-                option_letter = line[0]
-                option_text = line[2:].strip()
-                options[option_letter] = option_text
-            elif 'Correct Answer:' in line or 'Answer:' in line:
-                # Extract correct answer letter
-                match = re.search(r'[ABCD]', line)
-                if match:
-                    correct_answer = match.group()
-        
-        if question_text and options:
-            quiz_data[f"Q{i}"] = {
-                "question": question_text,
-                "options": options,
-                "correct": correct_answer
-            }
-    
-    return quiz_data
-
-def format_quiz_for_display(quiz_text: str) -> str:
-    """Format quiz for display without showing correct answers."""
-    # Remove correct answer lines
-    lines = quiz_text.split('\n')
-    display_lines = []
-    
-    for line in lines:
-        if not ('Correct Answer:' in line or 'Answer:' in line):
-            display_lines.append(line)
-    
-    return '\n'.join(display_lines)
-
-def verify_quiz_answers(answers: str) -> str:
-    """Verify quiz answers and provide feedback."""
-    if not pdf_manager.current_quiz:
-        return "⚠️ Please generate a quiz first."
-    
-    if not answers.strip():
-        return "⚠️ Please provide your answers."
-    
-    # Parse user answers
-    user_answers = {}
-    answer_lines = answers.strip().split('\n')
-    
-    for line in answer_lines:
-        line = line.strip().upper()
-        # Match patterns like "Q1: A" or "1. A" or "Q1 A"
-        match = re.match(r'Q?(\d+)[\s:.\-]+([ABCD])', line)
-        if match:
-            q_num = f"Q{match.group(1)}"
-            answer = match.group(2)
-            user_answers[q_num] = answer
-    
-    # Check answers
-    total_questions = len(pdf_manager.current_quiz)
-    correct_count = 0
-    result = "📊 **Quiz Results**\n\n"
-    result += "="*50 + "\n\n"
-    
-    for q_num, q_data in pdf_manager.current_quiz.items():
-        user_answer = user_answers.get(q_num, "Not Answered")
-        correct_answer = q_data["correct"]
-        
-        is_correct = user_answer == correct_answer
-        if is_correct:
-            correct_count += 1
-        
-        status = "✅ Correct" if is_correct else "❌ Incorrect"
-        
-        result += f"**{q_num}:** {q_data['question']}\n"
-        result += f"Your Answer: {user_answer}\n"
-        result += f"Correct Answer: {correct_answer}) {q_data['options'].get(correct_answer, 'N/A')}\n"
-        result += f"Status: {status}\n\n"
-        result += "-"*50 + "\n\n"
-    
-    # Calculate score
-    score_percentage = (correct_count / total_questions) * 100 if total_questions > 0 else 0
-    pdf_manager.quiz_score = score_percentage
-    
-    result += f"**Final Score: {correct_count}/{total_questions} ({score_percentage:.1f}%)**\n\n"
-    
-    if score_percentage >= 80:
-        result += "🎉 Excellent work! You have a great understanding of the material!\n"
-    elif score_percentage >= 60:
-        result += "👍 Good job! Keep reviewing to improve further.\n"
-    elif score_percentage >= 40:
-        result += "📚 Not bad, but more study is recommended.\n"
+        context = ""
     else:
-        result += "💪 Keep studying! Review the material and try again.\n"
+        context = pdf_manager.get_all_text()[:3000]
     
-    return result
+    prompt = f"Explain this academic doubt clearly and provide examples if helpful:\n\n{doubt}\n\nExplanation:"
+    explanation = generate_response(prompt, context, max_length=500)
+    
+    return explanation
 
 # ==================== EXPORT FUNCTIONS ====================
 def export_to_pdf(content: str, filename: str = "studymate_export.pdf") -> str:
@@ -408,7 +279,7 @@ def create_interface():
         gr.Markdown("""
         # 📚 StudyMate - Your AI Academic Assistant
         ### Powered by IBM Granite 3.0 2B Instruct
-        Upload PDFs, ask questions, get summaries, take quizzes, and export your learning materials!
+        Upload PDFs, ask questions, get summaries, and export your learning materials!
         """)
         
         with gr.Tab("📤 Upload PDFs"):
@@ -446,35 +317,12 @@ def create_interface():
             
             questions_btn.click(generate_questions, outputs=[questions_output])
         
-        with gr.Tab("🎯 Quiz"):
-            gr.Markdown("""
-            ### Take a Quiz Based on Your PDFs
-            Generate multiple-choice questions and test your knowledge!
-            """)
+        with gr.Tab("🤔 Doubt Assistant"):
+            doubt_input = gr.Textbox(label="Enter Your Doubt", placeholder="Explain your confusion or doubt...", lines=3)
+            doubt_btn = gr.Button("Get Explanation", variant="primary")
+            doubt_output = gr.Textbox(label="Explanation", lines=10)
             
-            with gr.Row():
-                num_questions = gr.Slider(minimum=3, maximum=10, value=5, step=1, label="Number of Questions")
-            
-            generate_quiz_btn = gr.Button("🎲 Generate Quiz", variant="primary", size="lg")
-            quiz_output = gr.Textbox(label="Quiz Questions", lines=20, show_copy_button=True)
-            
-            gr.Markdown("""
-            ---
-            ### Submit Your Answers
-            Format: Q1: A, Q2: B, Q3: C (one per line)
-            """)
-            
-            answer_input = gr.Textbox(
-                label="Your Answers", 
-                placeholder="Q1: A\nQ2: B\nQ3: C\nQ4: D\nQ5: A",
-                lines=8
-            )
-            
-            verify_btn = gr.Button("✅ Submit & Verify Answers", variant="primary", size="lg")
-            result_output = gr.Textbox(label="Results & Feedback", lines=20)
-            
-            generate_quiz_btn.click(generate_quiz, inputs=[num_questions], outputs=[quiz_output])
-            verify_btn.click(verify_quiz_answers, inputs=[answer_input], outputs=[result_output])
+            doubt_btn.click(doubt_assistant, inputs=[doubt_input], outputs=[doubt_output])
         
         with gr.Tab("💾 Export"):
             gr.Markdown("### Export Chat History")
@@ -501,7 +349,7 @@ def create_interface():
         - 📝 Smart summarization
         - 💡 Concept extraction
         - ❓ Question generation
-        - 🎯 Interactive Quiz with verification
+        - 🤔 Doubt resolution
         - 💾 Export to PDF/DOCX
         """)
     

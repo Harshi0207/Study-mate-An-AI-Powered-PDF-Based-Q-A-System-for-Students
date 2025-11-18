@@ -1,1 +1,513 @@
+import gradio as gr
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import PyPDF2
+import re
+from datetime import datetime
+from docx import Document
+from fpdf import FPDF
+import io
+import json
+from typing import List, Dict, Tuple
+import warnings
+warnings.filterwarnings('ignore')
 
+# ==================== CONFIGURATION ====================
+MODEL_NAME = "ibm-granite/granite-3.0-2b-instruct"
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+
+# ==================== MODEL INITIALIZATION ====================
+print("🚀 Loading IBM Granite 3.0 2B model...")
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        device_map="auto",
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        trust_remote_code=True
+    )
+    print("✅ Model loaded successfully!")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    raise
+
+# ==================== PDF STORAGE ====================
+class PDFManager:
+    def __init__(self):
+        self.pdfs = {}  # {filename: {"text": str, "chunks": list, "metadata": dict}}
+        self.chat_history = []
+        self.current_quiz = None
+        self.quiz_score = 0
+        
+    def add_pdf(self, file_path: str, file_name: str) -> str:
+        try:
+            text = extract_text_from_pdf(file_path)
+            if not text.strip():
+                return f"❌ Error: No text extracted from {file_name}"
+            
+            chunks = chunk_text(text)
+            self.pdfs[file_name] = {
+                "text": text,
+                "chunks": chunks,
+                "metadata": {
+                    "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "word_count": len(text.split()),
+                    "chunk_count": len(chunks)
+                }
+            }
+            return f"✅ Successfully processed: {file_name}\n📊 Words: {len(text.split())}, Chunks: {len(chunks)}"
+        except Exception as e:
+            return f"❌ Error processing {file_name}: {str(e)}"
+    
+    def get_all_text(self) -> str:
+        return "\n\n".join([f"=== {name} ===\n{data['text']}" for name, data in self.pdfs.items()])
+    
+    def get_pdf_list(self) -> str:
+        if not self.pdfs:
+            return "No PDFs uploaded yet."
+        result = "📚 Uploaded PDFs:\n\n"
+        for name, data in self.pdfs.items():
+            result += f"📄 {name}\n"
+            result += f"   • Words: {data['metadata']['word_count']}\n"
+            result += f"   • Uploaded: {data['metadata']['upload_time']}\n\n"
+        return result
+    
+    def clear(self):
+        self.pdfs = {}
+        self.chat_history = []
+        self.current_quiz = None
+        self.quiz_score = 0
+
+pdf_manager = PDFManager()
+
+# ==================== PDF PROCESSING FUNCTIONS ====================
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extract text from PDF file."""
+    text = ""
+    try:
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+    except Exception as e:
+        raise Exception(f"PDF extraction error: {str(e)}")
+    return text
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    """Split text into overlapping chunks."""
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = " ".join(words[i:i + chunk_size])
+        if chunk.strip():
+            chunks.append(chunk)
+    return chunks
+
+def preprocess_text(text: str) -> str:
+    """Clean and preprocess text."""
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\w\s.,!?;:()\-]', '', text)
+    return text.strip()
+
+# ==================== LLM FUNCTIONS ====================
+def generate_response(prompt: str, context: str = "", max_length: int = 512) -> str:
+    """Generate response using IBM Granite model."""
+    try:
+        if context:
+            full_prompt = f"Context:\n{context}\n\nQuestion: {prompt}\n\nAnswer:"
+        else:
+            full_prompt = prompt
+        
+        inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_length,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract only the answer part
+        if "Answer:" in response:
+            response = response.split("Answer:")[-1].strip()
+        elif "Question:" in response:
+            response = response.split("Question:")[-1].strip()
+            
+        return response
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
+
+# ==================== FEATURE FUNCTIONS ====================
+def answer_question(question: str, chat_history: List) -> Tuple[str, List]:
+    """Answer academic questions based on uploaded PDFs."""
+    if not pdf_manager.pdfs:
+        return "⚠️ Please upload at least one PDF first.", chat_history
+    
+    context = pdf_manager.get_all_text()[:4000]  # Limit context size
+    answer = generate_response(question, context, max_length=400)
+    
+    chat_history.append((question, answer))
+    pdf_manager.chat_history = chat_history
+    
+    return "", chat_history
+
+def summarize_content() -> str:
+    """Summarize all uploaded PDF content."""
+    if not pdf_manager.pdfs:
+        return "⚠️ Please upload at least one PDF first."
+    
+    summaries = []
+    for name, data in pdf_manager.pdfs.items():
+        text_preview = data['text'][:2000]
+        prompt = f"Provide a concise summary of the following academic content:\n\n{text_preview}\n\nSummary:"
+        summary = generate_response(prompt, max_length=300)
+        summaries.append(f"📄 {name}\n{summary}\n")
+    
+    return "\n".join(summaries)
+
+def extract_concepts() -> str:
+    """Extract key concepts from uploaded PDFs."""
+    if not pdf_manager.pdfs:
+        return "⚠️ Please upload at least one PDF first."
+    
+    concepts = []
+    for name, data in pdf_manager.pdfs.items():
+        text_preview = data['text'][:2000]
+        prompt = f"Extract the main concepts, topics, and key terms from this academic content:\n\n{text_preview}\n\nKey Concepts:"
+        concept_list = generate_response(prompt, max_length=300)
+        concepts.append(f"📄 {name}\n{concept_list}\n")
+    
+    return "\n".join(concepts)
+
+def generate_questions() -> str:
+    """Generate important questions from uploaded PDFs."""
+    if not pdf_manager.pdfs:
+        return "⚠️ Please upload at least one PDF first."
+    
+    all_questions = []
+    for name, data in pdf_manager.pdfs.items():
+        text_preview = data['text'][:2000]
+        prompt = f"Generate 5 important academic questions based on this content:\n\n{text_preview}\n\nQuestions:"
+        questions = generate_response(prompt, max_length=400)
+        all_questions.append(f"📄 {name}\n{questions}\n")
+    
+    return "\n".join(all_questions)
+
+# ==================== QUIZ FUNCTIONS ====================
+def generate_quiz(num_questions: int = 5) -> str:
+    """Generate a quiz from PDF content."""
+    if not pdf_manager.pdfs:
+        return "⚠️ Please upload at least one PDF first."
+    
+    context = pdf_manager.get_all_text()[:3000]
+    
+    prompt = f"""Based on the following content, generate exactly {num_questions} multiple-choice questions with 4 options each.
+Format each question EXACTLY as follows:
+
+Q1: [Question text]
+A) [Option A]
+B) [Option B]
+C) [Option C]
+D) [Option D]
+Correct Answer: [A/B/C/D]
+
+Content:
+{context}
+
+Generate the quiz:"""
+    
+    quiz_text = generate_response(prompt, max_length=800)
+    
+    # Parse and store quiz
+    pdf_manager.current_quiz = parse_quiz(quiz_text)
+    pdf_manager.quiz_score = 0
+    
+    # Format quiz for display (without correct answers)
+    display_quiz = format_quiz_for_display(quiz_text)
+    
+    return display_quiz
+
+def parse_quiz(quiz_text: str) -> Dict:
+    """Parse quiz text into structured format."""
+    quiz_data = {}
+    
+    # Split by question numbers
+    questions = re.split(r'Q\d+:', quiz_text)
+    questions = [q.strip() for q in questions if q.strip()]
+    
+    for i, question_block in enumerate(questions, 1):
+        lines = question_block.split('\n')
+        question_text = lines[0].strip() if lines else ""
+        
+        # Extract options
+        options = {}
+        correct_answer = ""
+        
+        for line in lines[1:]:
+            line = line.strip()
+            if line.startswith(('A)', 'B)', 'C)', 'D)')):
+                option_letter = line[0]
+                option_text = line[2:].strip()
+                options[option_letter] = option_text
+            elif 'Correct Answer:' in line or 'Answer:' in line:
+                # Extract correct answer letter
+                match = re.search(r'[ABCD]', line)
+                if match:
+                    correct_answer = match.group()
+        
+        if question_text and options:
+            quiz_data[f"Q{i}"] = {
+                "question": question_text,
+                "options": options,
+                "correct": correct_answer
+            }
+    
+    return quiz_data
+
+def format_quiz_for_display(quiz_text: str) -> str:
+    """Format quiz for display without showing correct answers."""
+    # Remove correct answer lines
+    lines = quiz_text.split('\n')
+    display_lines = []
+    
+    for line in lines:
+        if not ('Correct Answer:' in line or 'Answer:' in line):
+            display_lines.append(line)
+    
+    return '\n'.join(display_lines)
+
+def verify_quiz_answers(answers: str) -> str:
+    """Verify quiz answers and provide feedback."""
+    if not pdf_manager.current_quiz:
+        return "⚠️ Please generate a quiz first."
+    
+    if not answers.strip():
+        return "⚠️ Please provide your answers."
+    
+    # Parse user answers
+    user_answers = {}
+    answer_lines = answers.strip().split('\n')
+    
+    for line in answer_lines:
+        line = line.strip().upper()
+        # Match patterns like "Q1: A" or "1. A" or "Q1 A"
+        match = re.match(r'Q?(\d+)[\s:.\-]+([ABCD])', line)
+        if match:
+            q_num = f"Q{match.group(1)}"
+            answer = match.group(2)
+            user_answers[q_num] = answer
+    
+    # Check answers
+    total_questions = len(pdf_manager.current_quiz)
+    correct_count = 0
+    result = "📊 **Quiz Results**\n\n"
+    result += "="*50 + "\n\n"
+    
+    for q_num, q_data in pdf_manager.current_quiz.items():
+        user_answer = user_answers.get(q_num, "Not Answered")
+        correct_answer = q_data["correct"]
+        
+        is_correct = user_answer == correct_answer
+        if is_correct:
+            correct_count += 1
+        
+        status = "✅ Correct" if is_correct else "❌ Incorrect"
+        
+        result += f"**{q_num}:** {q_data['question']}\n"
+        result += f"Your Answer: {user_answer}\n"
+        result += f"Correct Answer: {correct_answer}) {q_data['options'].get(correct_answer, 'N/A')}\n"
+        result += f"Status: {status}\n\n"
+        result += "-"*50 + "\n\n"
+    
+    # Calculate score
+    score_percentage = (correct_count / total_questions) * 100 if total_questions > 0 else 0
+    pdf_manager.quiz_score = score_percentage
+    
+    result += f"**Final Score: {correct_count}/{total_questions} ({score_percentage:.1f}%)**\n\n"
+    
+    if score_percentage >= 80:
+        result += "🎉 Excellent work! You have a great understanding of the material!\n"
+    elif score_percentage >= 60:
+        result += "👍 Good job! Keep reviewing to improve further.\n"
+    elif score_percentage >= 40:
+        result += "📚 Not bad, but more study is recommended.\n"
+    else:
+        result += "💪 Keep studying! Review the material and try again.\n"
+    
+    return result
+
+# ==================== EXPORT FUNCTIONS ====================
+def export_to_pdf(content: str, filename: str = "studymate_export.pdf") -> str:
+    """Export content to PDF."""
+    try:
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        
+        # Handle special characters
+        content = content.encode('latin-1', 'replace').decode('latin-1')
+        
+        for line in content.split('\n'):
+            pdf.multi_cell(0, 10, txt=line)
+        
+        pdf.output(filename)
+        return f"✅ Exported to {filename}"
+    except Exception as e:
+        return f"❌ Export error: {str(e)}"
+
+def export_to_docx(content: str, filename: str = "studymate_export.docx") -> str:
+    """Export content to DOCX."""
+    try:
+        doc = Document()
+        doc.add_heading('StudyMate Export', 0)
+        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        doc.add_paragraph(content)
+        doc.save(filename)
+        return f"✅ Exported to {filename}"
+    except Exception as e:
+        return f"❌ Export error: {str(e)}"
+
+def export_chat_history() -> str:
+    """Export chat history."""
+    if not pdf_manager.chat_history:
+        return "⚠️ No chat history to export."
+    
+    content = "StudyMate Chat History\n" + "="*50 + "\n\n"
+    for i, (q, a) in enumerate(pdf_manager.chat_history, 1):
+        content += f"Q{i}: {q}\n\nA{i}: {a}\n\n{'-'*50}\n\n"
+    
+    pdf_result = export_to_pdf(content, "chat_history.pdf")
+    docx_result = export_to_docx(content, "chat_history.docx")
+    
+    return f"{pdf_result}\n{docx_result}"
+
+# ==================== FILE UPLOAD HANDLER ====================
+def upload_pdfs(files) -> str:
+    """Handle multiple PDF uploads."""
+    if not files:
+        return "⚠️ No files selected."
+    
+    results = []
+    for file in files:
+        result = pdf_manager.add_pdf(file.name, file.name.split('/')[-1])
+        results.append(result)
+    
+    return "\n".join(results)
+
+# ==================== GRADIO INTERFACE ====================
+def create_interface():
+    with gr.Blocks(title="StudyMate - Academic Assistant", theme=gr.themes.Soft()) as app:
+        gr.Markdown("""
+        # 📚 StudyMate - Your AI Academic Assistant
+        ### Powered by IBM Granite 3.0 2B Instruct
+        Upload PDFs, ask questions, get summaries, take quizzes, and export your learning materials!
+        """)
+        
+        with gr.Tab("📤 Upload PDFs"):
+            file_upload = gr.File(label="Upload PDF(s)", file_count="multiple", file_types=[".pdf"])
+            upload_btn = gr.Button("Process PDFs", variant="primary")
+            upload_output = gr.Textbox(label="Upload Status", lines=5)
+            pdf_list = gr.Textbox(label="Uploaded PDFs", lines=5)
+            
+            upload_btn.click(upload_pdfs, inputs=[file_upload], outputs=[upload_output])
+            upload_btn.click(lambda: pdf_manager.get_pdf_list(), outputs=[pdf_list])
+        
+        with gr.Tab("💬 Q&A Chat"):
+            chatbot = gr.Chatbot(label="Academic Chat", height=400)
+            question_input = gr.Textbox(label="Ask a Question", placeholder="Type your question here...")
+            ask_btn = gr.Button("Ask", variant="primary")
+            
+            ask_btn.click(answer_question, inputs=[question_input, chatbot], outputs=[question_input, chatbot])
+            question_input.submit(answer_question, inputs=[question_input, chatbot], outputs=[question_input, chatbot])
+        
+        with gr.Tab("📝 Summarize"):
+            summarize_btn = gr.Button("Generate Summary", variant="primary")
+            summary_output = gr.Textbox(label="Summary", lines=15)
+            
+            summarize_btn.click(summarize_content, outputs=[summary_output])
+        
+        with gr.Tab("💡 Concepts"):
+            concepts_btn = gr.Button("Extract Concepts", variant="primary")
+            concepts_output = gr.Textbox(label="Key Concepts", lines=15)
+            
+            concepts_btn.click(extract_concepts, outputs=[concepts_output])
+        
+        with gr.Tab("❓ Important Questions"):
+            questions_btn = gr.Button("Generate Questions", variant="primary")
+            questions_output = gr.Textbox(label="Important Questions", lines=15)
+            
+            questions_btn.click(generate_questions, outputs=[questions_output])
+        
+        with gr.Tab("🎯 Quiz"):
+            gr.Markdown("""
+            ### Take a Quiz Based on Your PDFs
+            Generate multiple-choice questions and test your knowledge!
+            """)
+            
+            with gr.Row():
+                num_questions = gr.Slider(minimum=3, maximum=10, value=5, step=1, label="Number of Questions")
+            
+            generate_quiz_btn = gr.Button("🎲 Generate Quiz", variant="primary", size="lg")
+            quiz_output = gr.Textbox(label="Quiz Questions", lines=20, show_copy_button=True)
+            
+            gr.Markdown("""
+            ---
+            ### Submit Your Answers
+            Format: Q1: A, Q2: B, Q3: C (one per line)
+            """)
+            
+            answer_input = gr.Textbox(
+                label="Your Answers", 
+                placeholder="Q1: A\nQ2: B\nQ3: C\nQ4: D\nQ5: A",
+                lines=8
+            )
+            
+            verify_btn = gr.Button("✅ Submit & Verify Answers", variant="primary", size="lg")
+            result_output = gr.Textbox(label="Results & Feedback", lines=20)
+            
+            generate_quiz_btn.click(generate_quiz, inputs=[num_questions], outputs=[quiz_output])
+            verify_btn.click(verify_quiz_answers, inputs=[answer_input], outputs=[result_output])
+        
+        with gr.Tab("💾 Export"):
+            gr.Markdown("### Export Chat History")
+            export_btn = gr.Button("Export Chat to PDF & DOCX", variant="primary")
+            export_output = gr.Textbox(label="Export Status", lines=3)
+            
+            export_btn.click(export_chat_history, outputs=[export_output])
+        
+        with gr.Tab("🗑️ Clear Data"):
+            clear_btn = gr.Button("Clear All Data", variant="stop")
+            clear_output = gr.Textbox(label="Status", lines=2)
+            
+            def clear_all():
+                pdf_manager.clear()
+                return "✅ All data cleared!"
+            
+            clear_btn.click(clear_all, outputs=[clear_output])
+        
+        gr.Markdown("""
+        ---
+        ### 🎯 Features:
+        - 📤 Upload multiple PDFs
+        - 💬 Conversational Q&A
+        - 📝 Smart summarization
+        - 💡 Concept extraction
+        - ❓ Question generation
+        - 🎯 Interactive Quiz with verification
+        - 💾 Export to PDF/DOCX
+        """)
+    
+    return app
+
+# ==================== LAUNCH APPLICATION ====================
+print("\n🎓 Starting StudyMate...")
+app = create_interface()
+app.launch(share=True, debug=True)
